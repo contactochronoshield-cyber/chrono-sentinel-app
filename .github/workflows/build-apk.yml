@@ -31,7 +31,12 @@ jobs:
       - name: Install buildozer and cython
         run: pip install --upgrade buildozer cython==0.29.36
 
+      - name: Constrain pip version used inside the build venv
+        run: echo "pip<24.1" > /tmp/pip-constraints.txt
+
       - name: Build APK
+        env:
+          PIP_CONSTRAINT: /tmp/pip-constraints.txt
         run: buildozer -v android debug
 
       - name: Upload APK
