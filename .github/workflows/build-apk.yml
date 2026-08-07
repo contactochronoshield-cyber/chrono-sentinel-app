@@ -11,38 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install system dependencies
+      - name: Build APK using Kivy's official buildozer Docker image
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git zip unzip autoconf libtool pkg-config \
-            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev libltdl-dev build-essential
-
-      - name: Install Android NDK using preinstalled SDK
-        run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
-
-      - name: Install buildozer and cython
-        run: pip install --upgrade buildozer cython==0.29.36
-
-      - name: Point buildozer to existing SDK/NDK
-        run: |
-          echo "android.sdk_path = $ANDROID_HOME" >> buildozer.spec
-          echo "android.ndk_path = $ANDROID_HOME/ndk/25.2.9519653" >> buildozer.spec
-
-      - name: Build APK
-        run: buildozer -v android debug
+          docker run --rm -v ${{ github.workspace }}:/home/user/hostcwd:z kivy/buildozer android debug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
