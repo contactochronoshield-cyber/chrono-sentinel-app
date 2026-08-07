@@ -1,14 +1,19 @@
 """
-Chrono Sentinel - Monitor de Infraestructura (v1 freemium)
-Free: 1 nodo en vivo. PRO: multi-nodo + alertas + AAP acustico.
-Licenciamiento PRO via Gumroad License Verification API.
+Chrono Sentinel - Monitor de Infraestructura (v2)
+Free: 1 nodo en vivo.
+PRO (licencia Gumroad): multi-nodo + alertas de umbral.
+AAP acustico: pendiente para v1.1 (requiere resolver formato de audio en Android).
 """
 
 import json
 import os
+import time
+import uuid
 from urllib.parse import urlencode
+
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 from kivy.uix.button import Button
@@ -18,34 +23,37 @@ from kivy.network.urlrequest import UrlRequest
 from kivy.core.window import Window
 from kivy.graphics import Color, Rectangle
 
-# --- Tema tactico (mismo lenguaje visual del dashboard: fondo oscuro, acentos cian) ---
+# --- Tema tactico ---
 BG = (0.04, 0.05, 0.06, 1)
+PANEL = (0.09, 0.11, 0.13, 1)
 CYAN = (0.16, 0.85, 0.85, 1)
 AMBER = (0.95, 0.7, 0.1, 1)
 GREEN = (0.2, 0.9, 0.4, 1)
 RED = (0.95, 0.25, 0.25, 1)
+GREY = (0.5, 0.5, 0.5, 1)
 FG = (0.85, 0.9, 0.92, 1)
 
 REFRESH_SECONDS = 4
+ALERT_THRESHOLD = 85
+ALERT_COOLDOWN_SECONDS = 300
+FREE_NODE_LIMIT = 1
 
-# --- Gumroad ---
-# Reemplaza esto con el "permalink" de tu producto en Gumroad
-# (lo ves en la URL: gumroad.com/l/ESTE_ES_EL_PERMALINK)
 GUMROAD_PRODUCT_PERMALINK = "chrono-sentinel-pro"
 GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
+
 LICENSE_FILENAME = "license.json"
+NODES_FILENAME = "nodes.json"
 
 
-def _license_path():
+def _data_path(filename):
     app = App.get_running_app()
     data_dir = app.user_data_dir if app else "."
     os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, LICENSE_FILENAME)
+    return os.path.join(data_dir, filename)
 
 
 def load_license_state():
-    """Lee del disco si ya hay una licencia PRO validada localmente."""
-    path = _license_path()
+    path = _data_path(LICENSE_FILENAME)
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
@@ -57,69 +65,157 @@ def load_license_state():
 
 
 def save_license_state(is_pro, license_key):
-    path = _license_path()
-    with open(path, "w") as f:
+    with open(_data_path(LICENSE_FILENAME), "w") as f:
         json.dump({"is_pro": is_pro, "license_key": license_key}, f)
 
 
-class StatRow(BoxLayout):
-    def __init__(self, label_text, **kwargs):
-        super().__init__(orientation="horizontal", size_hint_y=None, height=36, **kwargs)
-        self.name_lbl = Label(text=label_text, color=FG, size_hint_x=0.4, halign="left")
-        self.value_lbl = Label(text="--", color=CYAN, size_hint_x=0.6, halign="right")
-        self.add_widget(self.name_lbl)
-        self.add_widget(self.value_lbl)
+def load_nodes():
+    path = _data_path(NODES_FILENAME)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
 
-    def set_value(self, text, color=CYAN):
-        self.value_lbl.text = text
-        self.value_lbl.color = color
+
+def save_nodes(nodes):
+    with open(_data_path(NODES_FILENAME), "w") as f:
+        json.dump(nodes, f)
+
+
+def send_alert_notification(title, message):
+    try:
+        from plyer import notification
+        notification.notify(title=title, message=message, timeout=10)
+    except Exception:
+        pass
+
+
+def level_color(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return CYAN
+    if v >= ALERT_THRESHOLD:
+        return RED
+    if v >= 60:
+        return AMBER
+    return GREEN
+
+
+class NodeCard(BoxLayout):
+    def __init__(self, node, on_remove, is_pro_getter, **kwargs):
+        super().__init__(orientation="vertical", size_hint_y=None, height=140,
+                          padding=10, spacing=4, **kwargs)
+        self.node = node
+        self.on_remove = on_remove
+        self.is_pro_getter = is_pro_getter
+        self._last_alert = {}
+
+        with self.canvas.before:
+            Color(*PANEL)
+            self._bg = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=self._sync_bg, size=self._sync_bg)
+
+        header = BoxLayout(orientation="horizontal", size_hint_y=None, height=28)
+        header.add_widget(Label(text=node["name"], color=CYAN, bold=True, halign="left"))
+        remove_btn = Button(text="Quitar", size_hint_x=None, width=80,
+                             background_color=RED, font_size=12)
+        remove_btn.bind(on_press=lambda *a: self.on_remove(self.node["id"]))
+        header.add_widget(remove_btn)
+        self.add_widget(header)
+
+        self.status_lbl = Label(text="Esperando...", color=GREY, size_hint_y=None,
+                                 height=20, font_size=12)
+        self.add_widget(self.status_lbl)
+
+        self.stats_lbl = Label(text="CPU -- | RAM -- | Disco -- | Red --",
+                                color=FG, size_hint_y=None, height=24, font_size=13)
+        self.add_widget(self.stats_lbl)
+
+    def _sync_bg(self, *args):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+
+    def fetch(self, dt=None):
+        UrlRequest(self.node["url"], on_success=self._on_success,
+                   on_failure=self._on_fail, on_error=self._on_fail, timeout=6)
+
+    def _on_success(self, request, result):
+        if isinstance(result, str):
+            result = json.loads(result)
+        cpu = result.get("cpu", 0)
+        ram = result.get("ram", 0)
+        disk = result.get("disk", 0)
+        net = result.get("net", "--")
+
+        self.status_lbl.text = "En linea"
+        self.status_lbl.color = GREEN
+        self.stats_lbl.text = f"CPU {cpu}% | RAM {ram}% | Disco {disk}% | Red {net}"
+
+        if self.is_pro_getter():
+            self._check_alert("CPU", cpu)
+            self._check_alert("RAM", ram)
+            self._check_alert("Disco", disk)
+
+    def _on_fail(self, request, error):
+        self.status_lbl.text = "Error de conexion"
+        self.status_lbl.color = RED
+
+    def _check_alert(self, metric_name, value):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return
+        if v < ALERT_THRESHOLD:
+            return
+        now = time.time()
+        last = self._last_alert.get(metric_name, 0)
+        if now - last < ALERT_COOLDOWN_SECONDS:
+            return
+        self._last_alert[metric_name] = now
+        send_alert_notification(
+            f"Chrono Sentinel: {self.node['name']}",
+            f"{metric_name} al {v:.0f}% — revisa el nodo"
+        )
 
 
 class SentinelRoot(BoxLayout):
     def __init__(self, **kwargs):
         super().__init__(orientation="vertical", padding=16, spacing=10, **kwargs)
-
-        with self.canvas.before:
-            Color(*BG)
-            self.bg_rect = Rectangle(size=Window.size, pos=self.pos)
-        Window.bind(size=self._update_bg)
+        Window.clearcolor = BG
 
         self.add_widget(Label(
             text="CHRONO SENTINEL", color=CYAN, bold=True,
-            font_size=24, size_hint_y=None, height=40
+            font_size=26, size_hint_y=None, height=42
         ))
-        self.status_lbl = Label(text="Desconectado", color=AMBER, size_hint_y=None, height=24)
-        self.add_widget(self.status_lbl)
+        self.add_widget(Label(
+            text="Monitor de infraestructura en vivo", color=GREY,
+            size_hint_y=None, height=20, font_size=12
+        ))
 
-        self.server_input = TextInput(
-            hint_text="http://IP:5000/api/status", multiline=False,
-            size_hint_y=None, height=44, background_color=(0.1, 0.12, 0.14, 1),
-            foreground_color=FG
-        )
-        self.add_widget(self.server_input)
+        self.nodes = load_nodes()
+        self.node_cards = {}
 
-        connect_btn = Button(text="Conectar", size_hint_y=None, height=44,
-                              background_color=CYAN)
-        connect_btn.bind(on_press=self.start_polling)
-        self.add_widget(connect_btn)
+        self.node_list_layout = BoxLayout(orientation="vertical", size_hint_y=None, spacing=8)
+        self.node_list_layout.bind(minimum_height=self.node_list_layout.setter("height"))
 
-        self.rows = {
-            "hostname": StatRow("Nodo"),
-            "cpu": StatRow("CPU"),
-            "ram": StatRow("RAM"),
-            "disk": StatRow("Disco"),
-            "net": StatRow("Red"),
-        }
-        for row in self.rows.values():
-            self.add_widget(row)
+        scroll = ScrollView(size_hint=(1, 1))
+        scroll.add_widget(self.node_list_layout)
+        self.add_widget(scroll)
 
-        # --- Seccion PRO (bloqueada en free) ---
-        self.is_pro, saved_key = load_license_state()
+        add_node_btn = Button(text="+ Agregar nodo", size_hint_y=None, height=44,
+                               background_color=CYAN)
+        add_node_btn.bind(on_press=self.show_add_node_popup)
+        self.add_widget(add_node_btn)
+
+        self.is_pro, _saved_key = load_license_state()
 
         self.pro_status_lbl = Label(
-            text=self._pro_status_text(),
-            color=GREEN if self.is_pro else (0.5, 0.5, 0.5, 1),
-            size_hint_y=None, height=28
+            text=self._pro_status_text(), color=GREEN if self.is_pro else GREY,
+            size_hint_y=None, height=24, font_size=12
         )
         self.add_widget(self.pro_status_lbl)
 
@@ -131,71 +227,120 @@ class SentinelRoot(BoxLayout):
         self.pro_btn.bind(on_press=self.show_pro_popup)
         self.add_widget(self.pro_btn)
 
-        self._event = None
+        aap_btn = Button(text="AAP acustico — en desarrollo (v1.1)", size_hint_y=None,
+                          height=40, background_color=(0.25, 0.25, 0.27, 1), font_size=12)
+        aap_btn.bind(on_press=self.show_aap_notice)
+        self.add_widget(aap_btn)
+
+        for node in self.nodes:
+            self._add_node_card(node)
+
+        Clock.schedule_interval(self._poll_all, REFRESH_SECONDS)
 
     def _pro_status_text(self):
         if self.is_pro:
-            return "PRO: multi-nodo, alertas y AAP desbloqueados"
-        return "PRO: multi-nodo, alertas, AAP acustico"
+            return "PRO activo: nodos ilimitados + alertas de umbral"
+        return f"Free: hasta {FREE_NODE_LIMIT} nodo. PRO desbloquea multi-nodo y alertas."
 
-    def _update_bg(self, *args):
-        self.bg_rect.size = Window.size
+    def _poll_all(self, dt):
+        for card in self.node_cards.values():
+            card.fetch()
 
-    def start_polling(self, *args):
-        if self._event:
-            self._event.cancel()
-        self._event = Clock.schedule_interval(self.fetch_status, REFRESH_SECONDS)
-        self.fetch_status(0)
+    def _add_node_card(self, node):
+        card = NodeCard(node, on_remove=self.remove_node, is_pro_getter=lambda: self.is_pro)
+        self.node_cards[node["id"]] = card
+        self.node_list_layout.add_widget(card)
+        card.fetch()
 
-    def fetch_status(self, dt):
-        url = self.server_input.text.strip()
-        if not url:
-            self.status_lbl.text = "Ingresa la URL del servidor"
-            self.status_lbl.color = RED
+    def remove_node(self, node_id):
+        self.nodes = [n for n in self.nodes if n["id"] != node_id]
+        save_nodes(self.nodes)
+        card = self.node_cards.pop(node_id, None)
+        if card:
+            self.node_list_layout.remove_widget(card)
+
+    def show_add_node_popup(self, *args):
+        if not self.is_pro and len(self.nodes) >= FREE_NODE_LIMIT:
+            content = BoxLayout(orientation="vertical", padding=12, spacing=8)
+            content.add_widget(Label(
+                text=f"La version gratuita permite {FREE_NODE_LIMIT} nodo.\n"
+                     "Activa PRO para monitorear varios nodos a la vez.",
+                color=FG
+            ))
+            close_btn = Button(text="Entendido", size_hint_y=None, height=40)
+            popup = Popup(title="Limite alcanzado", content=content, size_hint=(0.85, 0.4))
+            close_btn.bind(on_press=popup.dismiss)
+            content.add_widget(close_btn)
+            popup.open()
             return
-        UrlRequest(url, on_success=self.on_success, on_failure=self.on_fail,
-                   on_error=self.on_fail, timeout=6)
 
-    def on_success(self, request, result):
-        if isinstance(result, str):
-            result = json.loads(result)
-        self.status_lbl.text = "En linea"
-        self.status_lbl.color = GREEN
-        self.rows["hostname"].set_value(str(result.get("hostname", "--")))
-        self.rows["cpu"].set_value(f"{result.get('cpu', 0)}%", self._level_color(result.get("cpu", 0)))
-        self.rows["ram"].set_value(f"{result.get('ram', 0)}%", self._level_color(result.get("ram", 0)))
-        self.rows["disk"].set_value(f"{result.get('disk', 0)}%", self._level_color(result.get("disk", 0)))
-        self.rows["net"].set_value(str(result.get("net", "--")))
+        content = BoxLayout(orientation="vertical", padding=12, spacing=8)
+        name_input = TextInput(hint_text="Nombre del nodo (ej. Servidor Bogota)",
+                                multiline=False, size_hint_y=None, height=44,
+                                background_color=(0.1, 0.12, 0.14, 1), foreground_color=FG)
+        url_input = TextInput(hint_text="http://IP:5000/api/status", multiline=False,
+                               size_hint_y=None, height=44,
+                               background_color=(0.1, 0.12, 0.14, 1), foreground_color=FG)
+        content.add_widget(name_input)
+        content.add_widget(url_input)
 
-    def on_fail(self, request, error):
-        self.status_lbl.text = "Error de conexion"
-        self.status_lbl.color = RED
+        feedback_lbl = Label(text="", color=RED, size_hint_y=None, height=24)
+        content.add_widget(feedback_lbl)
 
-    @staticmethod
-    def _level_color(value):
-        try:
-            v = float(value)
-        except (TypeError, ValueError):
-            return CYAN
-        if v >= 85:
-            return RED
-        if v >= 60:
-            return AMBER
-        return GREEN
+        btn_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=44, spacing=8)
+        save_btn = Button(text="Guardar", background_color=CYAN)
+        cancel_btn = Button(text="Cancelar")
+        btn_row.add_widget(save_btn)
+        btn_row.add_widget(cancel_btn)
+        content.add_widget(btn_row)
+
+        popup = Popup(title="Agregar nodo", content=content, size_hint=(0.9, 0.55))
+        cancel_btn.bind(on_press=lambda *a: popup.dismiss())
+
+        def do_save(*a):
+            name = name_input.text.strip()
+            url = url_input.text.strip()
+            if not name or not url:
+                feedback_lbl.text = "Completa nombre y URL"
+                return
+            node = {"id": str(uuid.uuid4()), "name": name, "url": url}
+            self.nodes.append(node)
+            save_nodes(self.nodes)
+            self._add_node_card(node)
+            popup.dismiss()
+
+        save_btn.bind(on_press=do_save)
+        popup.open()
+
+    def show_aap_notice(self, *args):
+        content = BoxLayout(orientation="vertical", padding=12, spacing=8)
+        content.add_widget(Label(
+            text="El modulo AAP (deteccion acustica de sabotaje)\n"
+                 "ya funciona en Termux via linea de comandos.\n\n"
+                 "Integrarlo aqui requiere resolver el formato\n"
+                 "de grabacion de audio de Android (3gp) antes\n"
+                 "de poder correr el analisis FFT. Queda para\n"
+                 "la siguiente version.",
+            color=FG
+        ))
+        close_btn = Button(text="Cerrar", size_hint_y=None, height=40)
+        popup = Popup(title="AAP acustico", content=content, size_hint=(0.9, 0.6))
+        close_btn.bind(on_press=popup.dismiss)
+        content.add_widget(close_btn)
+        popup.open()
 
     def show_pro_popup(self, *args):
         if self.is_pro:
             content = BoxLayout(orientation="vertical", padding=12, spacing=8)
             content.add_widget(Label(
                 text="Tu licencia PRO ya esta activa en este dispositivo.\n\n"
-                     "Multi-nodo, alertas y AAP acustico desbloqueados.",
+                     "Nodos ilimitados y alertas de umbral desbloqueados.",
                 color=FG
             ))
             close_btn = Button(text="Cerrar", size_hint_y=None, height=40)
-            close_btn.bind(on_press=lambda *a: popup.dismiss())
+            popup = Popup(title="Chrono Sentinel PRO", content=content, size_hint=(0.85, 0.5))
+            close_btn.bind(on_press=popup.dismiss)
             content.add_widget(close_btn)
-            popup = Popup(title="Chrono Sentinel PRO", content=content,
-                           size_hint=(0.85, 0.5))
             popup.open()
             return
 
@@ -204,11 +349,9 @@ class SentinelRoot(BoxLayout):
             text="Compra la licencia en Gumroad y pega aqui\ntu clave de licencia:",
             color=FG, size_hint_y=None, height=60
         ))
-        key_input = TextInput(
-            hint_text="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX",
-            multiline=False, size_hint_y=None, height=44,
-            background_color=(0.1, 0.12, 0.14, 1), foreground_color=FG
-        )
+        key_input = TextInput(hint_text="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX",
+                               multiline=False, size_hint_y=None, height=44,
+                               background_color=(0.1, 0.12, 0.14, 1), foreground_color=FG)
         content.add_widget(key_input)
 
         self.pro_feedback_lbl = Label(text="", color=AMBER, size_hint_y=None, height=28)
@@ -221,12 +364,9 @@ class SentinelRoot(BoxLayout):
         btn_row.add_widget(cancel_btn)
         content.add_widget(btn_row)
 
-        popup = Popup(title="Activar Chrono Sentinel PRO", content=content,
-                       size_hint=(0.9, 0.55))
+        popup = Popup(title="Activar Chrono Sentinel PRO", content=content, size_hint=(0.9, 0.55))
         cancel_btn.bind(on_press=lambda *a: popup.dismiss())
-        verify_btn.bind(
-            on_press=lambda *a: self.verify_license(key_input.text.strip(), popup)
-        )
+        verify_btn.bind(on_press=lambda *a: self.verify_license(key_input.text.strip(), popup))
         popup.open()
 
     def verify_license(self, license_key, popup):
