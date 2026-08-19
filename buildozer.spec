@@ -4,7 +4,7 @@ package.name = chronosentinel
 package.domain = com.chronoshield
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
-version = 0.3.0
+version = 0.5.0
 requirements = python3,kivy,plyer
 
 orientation = portrait
