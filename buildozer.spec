@@ -5,7 +5,7 @@ package.domain = com.chronoshield
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 version = 0.5.0
-requirements = python3,kivy,requests
+requirements = python3,kivy,openssl,requests,urllib3,certifi,charset-normalizer,idna
 
 orientation = portrait
 fullscreen = 0
