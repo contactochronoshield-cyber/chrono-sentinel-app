@@ -1,9 +1,8 @@
 """
-Chrono Sentinel - Monitor de Infraestructura (v0.3)
+Chrono Sentinel - Monitor de Infraestructura (v0.4)
 Free: 1 nodo en vivo.
-PRO (licencia Gumroad): multi-nodo + alertas de umbral + deteccion de caida.
-Nuevo en v0.3: historial (sparkline), deteccion de nodo caido, notificaciones
-via ntfy.sh, soporte para endpoints JSON simple o texto tipo Prometheus.
+PRO (licencia Gumroad): multi-nodo + alertas de umbral + deteccion de caida +
+prediccion de saturacion + anomalias por linea base + correlacion multi-nodo.
 AAP acustico: pendiente (requiere resolver formato de audio en Android).
 """
 
@@ -31,16 +30,28 @@ CYAN = (0.16, 0.85, 0.85, 1)
 AMBER = (0.95, 0.7, 0.1, 1)
 GREEN = (0.2, 0.9, 0.4, 1)
 RED = (0.95, 0.25, 0.25, 1)
+PURPLE = (0.7, 0.4, 0.95, 1)
 GREY = (0.5, 0.5, 0.5, 1)
 FG = (0.85, 0.9, 0.92, 1)
 
 REFRESH_SECONDS = 4
 ALERT_THRESHOLD = 85
 ALERT_COOLDOWN_SECONDS = 300
+PREDICTION_COOLDOWN_SECONDS = 1800
 FREE_NODE_LIMIT = 1
 HISTORY_LENGTH = 20
 OFFLINE_AFTER_FAILURES = 3
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+
+PREDICTION_MIN_SAMPLES = 6
+PREDICTION_MIN_CURRENT_VALUE = 40
+PREDICTION_MAX_HOURS = 24
+
+ANOMALY_MIN_SAMPLES = 10
+ANOMALY_MIN_STDDEV = 3
+ANOMALY_STDDEV_MULTIPLIER = 2.5
+
+CORRELATION_MIN_NODES = 2
 
 GUMROAD_PRODUCT_PERMALINK = "chrono-sentinel-pro"
 GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
@@ -159,6 +170,33 @@ def sparkline(values):
     return "".join(out)
 
 
+def compute_trend_slope(timed_values):
+    n = len(timed_values)
+    if n < PREDICTION_MIN_SAMPLES:
+        return None
+    x0 = timed_values[0][0]
+    xs = [t - x0 for t, v in timed_values]
+    ys = [v for t, v in timed_values]
+    sum_x = sum(xs)
+    sum_y = sum(ys)
+    sum_xy = sum(x * y for x, y in zip(xs, ys))
+    sum_x2 = sum(x * x for x in xs)
+    denom = (n * sum_x2 - sum_x ** 2)
+    if denom == 0:
+        return None
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    return slope
+
+
+def mean_stddev(values):
+    n = len(values)
+    if n < 2:
+        return None, None
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n
+    return mean, variance ** 0.5
+
+
 def parse_metrics(raw_text):
     raw_text = raw_text.strip()
     try:
@@ -195,17 +233,21 @@ def parse_metrics(raw_text):
 
 
 class NodeCard(BoxLayout):
-    def __init__(self, node, on_remove, is_pro_getter, ntfy_getter, **kwargs):
-        super().__init__(orientation="vertical", size_hint_y=None, height=170,
+    def __init__(self, node, on_remove, is_pro_getter, ntfy_getter, on_status_change, **kwargs):
+        super().__init__(orientation="vertical", size_hint_y=None, height=220,
                           padding=10, spacing=4, **kwargs)
         self.node = node
         self.on_remove = on_remove
         self.is_pro_getter = is_pro_getter
         self.ntfy_getter = ntfy_getter
+        self.on_status_change = on_status_change
+
         self._last_alert = {}
         self._consecutive_failures = 0
         self._last_success_time = None
         self._cpu_history = []
+        self._timed_history = {"cpu": [], "ram": [], "disk": []}
+        self._is_problem = False
 
         with self.canvas.before:
             Color(*PANEL)
@@ -232,9 +274,22 @@ class NodeCard(BoxLayout):
                                   height=24, font_size=13)
         self.add_widget(self.history_lbl)
 
+        self.predict_lbl = Label(text="", color=AMBER, size_hint_y=None,
+                                  height=20, font_size=11)
+        self.add_widget(self.predict_lbl)
+
+        self.anomaly_lbl = Label(text="", color=PURPLE, size_hint_y=None,
+                                  height=20, font_size=11)
+        self.add_widget(self.anomaly_lbl)
+
     def _sync_bg(self, *args):
         self._bg.pos = self.pos
         self._bg.size = self.size
+
+    def _set_problem(self, is_problem):
+        if is_problem != self._is_problem:
+            self._is_problem = is_problem
+            self.on_status_change(self.node["id"], is_problem)
 
     def fetch(self, dt=None):
         UrlRequest(self.node["url"], on_success=self._on_success,
@@ -256,10 +311,11 @@ class NodeCard(BoxLayout):
 
         cpu, ram, disk = parsed["cpu"], parsed["ram"], parsed["disk"]
         net = parsed["net"]
+        now = time.time()
 
         was_offline = self._consecutive_failures >= OFFLINE_AFTER_FAILURES
         self._consecutive_failures = 0
-        self._last_success_time = time.time()
+        self._last_success_time = now
 
         self.status_lbl.text = "En linea"
         self.status_lbl.color = GREEN
@@ -272,14 +328,33 @@ class NodeCard(BoxLayout):
         self._cpu_history = self._cpu_history[-HISTORY_LENGTH:]
         self.history_lbl.text = f"Historial CPU: {sparkline(self._cpu_history)}"
 
+        for metric_name, value in (("cpu", cpu), ("ram", ram), ("disk", disk)):
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                continue
+            self._timed_history[metric_name].append((now, v))
+            self._timed_history[metric_name] = self._timed_history[metric_name][-HISTORY_LENGTH:]
+
         if was_offline and self.is_pro_getter():
             send_alert(f"Chrono Sentinel: {self.node['name']}",
                        "El nodo volvio a responder", self.ntfy_getter())
 
-        if self.is_pro_getter():
-            self._check_alert("CPU", cpu)
-            self._check_alert("RAM", ram)
-            self._check_alert("Disco", disk)
+        is_pro = self.is_pro_getter()
+        problem_this_tick = False
+
+        if is_pro:
+            if self._check_alert("CPU", cpu):
+                problem_this_tick = True
+            if self._check_alert("RAM", ram):
+                problem_this_tick = True
+            if self._check_alert("Disco", disk):
+                problem_this_tick = True
+            self._run_prediction()
+            if self._run_anomaly_check(cpu, ram, disk):
+                problem_this_tick = True
+
+        self._set_problem(problem_this_tick)
 
     def _on_fail(self, request, error):
         self._consecutive_failures += 1
@@ -291,6 +366,7 @@ class NodeCard(BoxLayout):
             self.status_lbl.color = RED
             if self.is_pro_getter():
                 self._check_alert("_offline", 100, force_key="_offline")
+            self._set_problem(True)
         else:
             self.status_lbl.text = "Error de conexion"
             self.status_lbl.color = AMBER
@@ -299,20 +375,80 @@ class NodeCard(BoxLayout):
         try:
             v = float(value)
         except (TypeError, ValueError):
-            return
+            return False
         key = force_key or metric_name
-        if force_key is None and v < ALERT_THRESHOLD:
-            return
+        is_over = force_key is not None or v >= ALERT_THRESHOLD
+        if not is_over:
+            return False
         now = time.time()
         last = self._last_alert.get(key, 0)
-        if now - last < ALERT_COOLDOWN_SECONDS:
-            return
-        self._last_alert[key] = now
-        if force_key == "_offline":
-            msg = f"Sin respuesta desde hace varios intentos — revisa el nodo"
-        else:
-            msg = f"{metric_name} al {v:.0f}% — revisa el nodo"
-        send_alert(f"Chrono Sentinel: {self.node['name']}", msg, self.ntfy_getter())
+        if now - last >= ALERT_COOLDOWN_SECONDS:
+            self._last_alert[key] = now
+            if force_key == "_offline":
+                msg = "Sin respuesta desde hace varios intentos — revisa el nodo"
+            else:
+                msg = f"{metric_name} al {v:.0f}% — revisa el nodo"
+            send_alert(f"Chrono Sentinel: {self.node['name']}", msg, self.ntfy_getter())
+        return True
+
+    def _run_prediction(self):
+        warnings = []
+        for metric_label, metric_key in (("disco", "disk"), ("RAM", "ram")):
+            history = self._timed_history[metric_key]
+            if not history:
+                continue
+            current_value = history[-1][1]
+            if current_value < PREDICTION_MIN_CURRENT_VALUE:
+                continue
+            slope = compute_trend_slope(history)
+            if slope is None or slope <= 0:
+                continue
+            hours_to_100 = (100 - current_value) / (slope * 3600)
+            if 0 < hours_to_100 <= PREDICTION_MAX_HOURS:
+                warnings.append(f"{metric_label}: llega a 100% en ~{hours_to_100:.1f}h")
+                key = f"predict_{metric_key}"
+                now = time.time()
+                if now - self._last_alert.get(key, 0) >= PREDICTION_COOLDOWN_SECONDS:
+                    self._last_alert[key] = now
+                    send_alert(
+                        f"Chrono Sentinel: {self.node['name']}",
+                        f"Prediccion: {metric_label} se saturara en ~{hours_to_100:.1f}h "
+                        "si sigue esta tendencia",
+                        self.ntfy_getter()
+                    )
+        self.predict_lbl.text = " | ".join(warnings) if warnings else ""
+
+    def _run_anomaly_check(self, cpu, ram, disk):
+        found_anomaly = False
+        anomalies = []
+        for metric_label, metric_key, current in (
+            ("CPU", "cpu", cpu), ("RAM", "ram", ram), ("Disco", "disk", disk)
+        ):
+            history = [v for _, v in self._timed_history[metric_key][:-1]]
+            if len(history) < ANOMALY_MIN_SAMPLES:
+                continue
+            mean, std = mean_stddev(history)
+            if mean is None or std is None or std < ANOMALY_MIN_STDDEV:
+                continue
+            try:
+                current_v = float(current)
+            except (TypeError, ValueError):
+                continue
+            if abs(current_v - mean) > ANOMALY_STDDEV_MULTIPLIER * std:
+                anomalies.append(f"{metric_label} inusual ({current_v:.0f}% vs ~{mean:.0f}% normal)")
+                found_anomaly = True
+                key = f"anomaly_{metric_key}"
+                now = time.time()
+                if now - self._last_alert.get(key, 0) >= ALERT_COOLDOWN_SECONDS:
+                    self._last_alert[key] = now
+                    send_alert(
+                        f"Chrono Sentinel: {self.node['name']}",
+                        f"Comportamiento inusual: {metric_label} en {current_v:.0f}% "
+                        f"(su normal es ~{mean:.0f}%)",
+                        self.ntfy_getter()
+                    )
+        self.anomaly_lbl.text = " | ".join(anomalies) if anomalies else ""
+        return found_anomaly
 
 
 class SentinelRoot(BoxLayout):
@@ -321,6 +457,8 @@ class SentinelRoot(BoxLayout):
         Window.clearcolor = BG
 
         self.settings = load_settings()
+        self._problem_nodes = set()
+        self._last_correlation_alert = 0
 
         self.add_widget(Label(
             text="CHRONO SENTINEL", color=CYAN, bold=True,
@@ -330,6 +468,11 @@ class SentinelRoot(BoxLayout):
             text="Monitor de infraestructura en vivo", color=GREY,
             size_hint_y=None, height=20, font_size=12
         ))
+
+        self.correlation_banner = Label(
+            text="", color=RED, bold=True, size_hint_y=None, height=0, font_size=13
+        )
+        self.add_widget(self.correlation_banner)
 
         self.nodes = load_nodes()
         self.node_cards = {}
@@ -379,8 +522,8 @@ class SentinelRoot(BoxLayout):
 
     def _pro_status_text(self):
         if self.is_pro:
-            return "PRO activo: nodos ilimitados + alertas + deteccion de caida"
-        return f"Free: hasta {FREE_NODE_LIMIT} nodo. PRO desbloquea multi-nodo y alertas."
+            return "PRO: multi-nodo + alertas + prediccion + anomalias + correlacion"
+        return f"Free: hasta {FREE_NODE_LIMIT} nodo. PRO desbloquea todo el analisis avanzado."
 
     def _get_ntfy_topic(self):
         return self.settings.get("ntfy_topic", "")
@@ -389,9 +532,35 @@ class SentinelRoot(BoxLayout):
         for card in self.node_cards.values():
             card.fetch()
 
+    def on_node_status_change(self, node_id, is_problem):
+        if is_problem:
+            self._problem_nodes.add(node_id)
+        else:
+            self._problem_nodes.discard(node_id)
+
+        if len(self._problem_nodes) >= CORRELATION_MIN_NODES:
+            self.correlation_banner.text = (
+                f"⚠ {len(self._problem_nodes)} nodos con problemas al mismo tiempo — "
+                "posible causa comun (red/ISP compartido)"
+            )
+            self.correlation_banner.height = 40
+            now = time.time()
+            if now - self._last_correlation_alert >= ALERT_COOLDOWN_SECONDS:
+                self._last_correlation_alert = now
+                send_alert(
+                    "Chrono Sentinel: posible problema comun",
+                    f"{len(self._problem_nodes)} nodos con problemas simultaneos — "
+                    "revisa si comparten proveedor de red antes de tratarlos por separado",
+                    self._get_ntfy_topic()
+                )
+        else:
+            self.correlation_banner.text = ""
+            self.correlation_banner.height = 0
+
     def _add_node_card(self, node):
         card = NodeCard(node, on_remove=self.remove_node, is_pro_getter=lambda: self.is_pro,
-                         ntfy_getter=self._get_ntfy_topic)
+                         ntfy_getter=self._get_ntfy_topic,
+                         on_status_change=self.on_node_status_change)
         self.node_cards[node["id"]] = card
         self.node_list_layout.add_widget(card)
         card.fetch()
@@ -402,6 +571,7 @@ class SentinelRoot(BoxLayout):
         card = self.node_cards.pop(node_id, None)
         if card:
             self.node_list_layout.remove_widget(card)
+        self._problem_nodes.discard(node_id)
 
     def show_notif_popup(self, *args):
         content = BoxLayout(orientation="vertical", padding=12, spacing=8)
@@ -514,12 +684,13 @@ class SentinelRoot(BoxLayout):
             content = BoxLayout(orientation="vertical", padding=12, spacing=8)
             content.add_widget(Label(
                 text="Tu licencia PRO ya esta activa en este dispositivo.\n\n"
-                     "Nodos ilimitados, alertas de umbral y deteccion\n"
-                     "de caida desbloqueados.",
+                     "Nodos ilimitados, alertas de umbral, deteccion de caida,\n"
+                     "prediccion de saturacion, anomalias y correlacion\n"
+                     "entre nodos desbloqueados.",
                 color=FG
             ))
             close_btn = Button(text="Cerrar", size_hint_y=None, height=40)
-            popup = Popup(title="Chrono Sentinel PRO", content=content, size_hint=(0.85, 0.5))
+            popup = Popup(title="Chrono Sentinel PRO", content=content, size_hint=(0.85, 0.55))
             close_btn.bind(on_press=popup.dismiss)
             content.add_widget(close_btn)
             popup.open()
